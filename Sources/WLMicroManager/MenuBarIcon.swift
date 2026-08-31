@@ -80,31 +80,33 @@ enum MenuBarIcon {
             return symbol
         }
 
-        // Compose symbol + status dot into one non-template image.
+        // Compose symbol + status dot into one non-template image. A drawing
+        // handler rather than lockFocus: the handler re-runs on every draw,
+        // under the menu bar's current appearance and the target display's
+        // scale — a lockFocus bitmap bakes both in and goes stale on a
+        // light/dark switch.
         let canvas = NSSize(width: symbolSize.width, height: symbolSize.height)
-        let composed = NSImage(size: canvas)
-        composed.lockFocus()
+        let composed = NSImage(size: canvas, flipped: false) { _ in
+            NSColor.labelColor.set()
+            let symbolRect = NSRect(
+                x: (canvas.width - symbol.size.width) / 2,
+                y: (canvas.height - symbol.size.height) / 2 + 1,
+                width: symbol.size.width,
+                height: symbol.size.height
+            )
+            symbol.draw(in: symbolRect, from: .zero, operation: .sourceOver, fraction: 1)
 
-        NSColor.labelColor.set()
-        let symbolRect = NSRect(
-            x: (canvas.width - symbol.size.width) / 2,
-            y: (canvas.height - symbol.size.height) / 2 + 1,
-            width: symbol.size.width,
-            height: symbol.size.height
-        )
-        symbol.draw(in: symbolRect, from: .zero, operation: .sourceOver, fraction: 1)
-
-        let diameter: CGFloat = 5
-        let dotRect = NSRect(
-            x: canvas.width - diameter - 0.5,
-            y: 0,
-            width: diameter,
-            height: diameter
-        )
-        dot.setFill()
-        NSBezierPath(ovalIn: dotRect).fill()
-
-        composed.unlockFocus()
+            let diameter: CGFloat = 5
+            let dotRect = NSRect(
+                x: canvas.width - diameter - 0.5,
+                y: 0,
+                width: diameter,
+                height: diameter
+            )
+            dot.setFill()
+            NSBezierPath(ovalIn: dotRect).fill()
+            return true
+        }
         composed.isTemplate = false
         return composed
     }

@@ -42,6 +42,11 @@ public final class PadEmulator: ObservableObject {
     @Published public private(set) var ambientZone = OAI.Zone.dark
     /// A short tail of RPC traffic, so the window can show what it was told.
     @Published public private(set) var traffic: [String] = []
+    /// Lines noted over this emulator's lifetime — monotonic, unlike
+    /// `traffic.count`, which pins at the ring-buffer cap. Views keying their
+    /// auto-scroll off a count need this one, or the scroll silently dies the
+    /// moment the buffer saturates.
+    @Published public private(set) var trafficTotal = 0
 
     /// Set by `WLDevice` to deliver device-pushed notifications.
     var onNotify: ((String, Any?) -> Void)?
@@ -226,6 +231,7 @@ public final class PadEmulator: ObservableObject {
 
     private func note(_ line: String) {
         traffic.append(line)
+        trafficTotal += 1
         if traffic.count > 80 { traffic.removeFirst(traffic.count - 80) }
     }
 

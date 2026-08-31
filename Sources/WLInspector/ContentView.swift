@@ -282,7 +282,10 @@ struct LogView: View {
                     }
                     .padding(.vertical, 4)
                 }
-                .onChange(of: model.entries.count) { _ in
+                // Keyed off the last entry's id, not the count — the ring
+                // buffer pins the count at its cap, which froze the
+                // follow-scroll exactly when the log was busiest.
+                .onChange(of: model.entries.last?.id) { _ in
                     guard model.autoScroll, let last = model.visibleEntries.last else { return }
                     withAnimation(.linear(duration: 0.1)) { proxy.scrollTo(last.id, anchor: .bottom) }
                 }

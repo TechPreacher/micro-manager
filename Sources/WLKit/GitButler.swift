@@ -84,8 +84,13 @@ public enum GitButler {
         } catch {
             return nil
         }
+        // A profile that blocks — network mounts, a broken plugin manager —
+        // must not hang the first `but` lookup forever.
+        let watchdog = DispatchWorkItem { if process.isRunning { process.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 10, execute: watchdog)
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
+        watchdog.cancel()
 
         let path = String(decoding: data, as: UTF8.self)
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -146,10 +151,12 @@ public enum GitButler {
         color: Bool = true,
         timeout: TimeInterval = 15
     ) async throws -> StatusOutput {
-        guard let binary = locateBinary() else { throw Failure.binaryNotFound }
-        return try await withCheckedThrowingContinuation { continuation in
+        try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
+                    // Resolved here, off the cooperative pool: the first
+                    // lookup may block on a login shell reading its profile.
+                    guard let binary = locateBinary() else { throw Failure.binaryNotFound }
                     let output = try launch(
                         binary, arguments: arguments, in: directory,
                         color: color, timeout: timeout
@@ -200,20 +207,57 @@ public enum GitButler {
             throw Failure.launchFailed(error.localizedDescription)
         }
 
+        // The watchdog escalates — SIGTERM at the deadline, SIGKILL for a
+        // child that shrugs it off — and marks the run, so a timeout is
+        // reported as one instead of masquerading as an ordinary failure.
+        // (`Once.claim` is true exactly once: the watchdog claims it when it
+        // fires, and an unclaimed flag afterwards means no timeout.)
+        let timedOut = Once()
+        let pid = process.processIdentifier
         let watchdog = DispatchWorkItem {
-            if process.isRunning { process.terminate() }
+            guard process.isRunning, timedOut.claim() else { return }
+            process.terminate()
+            DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
+                if process.isRunning { kill(pid, SIGKILL) }
+            }
         }
         DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: watchdog)
 
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        // Read on a queue of its own: the pipe only reaches EOF when every
+        // writer closes it, and a grandchild `but` spawned can outlive the
+        // SIGKILLed child while holding the write end. Give the read a
+        // bounded wait and abandon the reader thread to a peer like that
+        // rather than hanging this caller forever.
+        let collected = DataBox()
+        let reader = DispatchGroup()
+        DispatchQueue.global().async(group: reader) {
+            collected.value = pipe.fileHandleForReading.readDataToEndOfFile()
+        }
+        _ = reader.wait(timeout: .now() + timeout + 4)
         process.waitUntilExit()
         watchdog.cancel()
 
+        if !timedOut.claim() {
+            throw Failure.commandFailed(
+                "`but \(arguments.first ?? "")` timed out after \(Int(timeout))s."
+            )
+        }
+
         return StatusOutput(
-            text: String(decoding: data, as: UTF8.self),
+            text: String(decoding: collected.value ?? Data(), as: UTF8.self),
             succeeded: process.terminationStatus == 0,
             directory: directory
         )
+    }
+
+    /// A locked box for the reader thread's result.
+    private final class DataBox: @unchecked Sendable {
+        private var stored: Data?
+        private let lock = NSLock()
+        var value: Data? {
+            get { lock.lock(); defer { lock.unlock() }; return stored }
+            set { lock.lock(); stored = newValue; lock.unlock() }
+        }
     }
 
     /// Resolving through a login shell costs a shell startup, so hold onto the
