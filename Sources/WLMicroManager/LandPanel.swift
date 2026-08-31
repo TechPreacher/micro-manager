@@ -131,41 +131,26 @@ final class LandPanelController {
     }
 
     private static func prepare() async -> Preparation {
-        let agent: HerdrAgent?
-        do {
-            agent = try await HerdrClient.focusedAgent()
-        } catch {
-            return .blocked(title: "Herdr", subtitle: "", message: error.localizedDescription)
-        }
-        guard let agent else {
-            return .blocked(
-                title: "No focused agent",
-                subtitle: "",
-                message: "Nothing has focus in Herdr right now."
-            )
-        }
-        guard let directory = agent.workingDirectory else {
-            return .blocked(
-                title: agent.shortName,
-                subtitle: "",
-                message: "Herdr did not report a working directory for this agent."
-            )
+        let repo: FocusedRepo.Resolved
+        switch await FocusedRepo.resolve() {
+        case .failure(let blocked):
+            return .blocked(title: blocked.title, subtitle: blocked.subtitle, message: blocked.message)
+        case .success(let resolved):
+            repo = resolved
         }
 
-        let title = (directory as NSString).lastPathComponent
-        let subtitle = PanelHTML.abbreviate(directory)
         do {
-            let plan = try await GitButler.landPlan(in: directory)
+            let plan = try await GitButler.landPlan(in: repo.directory)
             guard !plan.isEmpty else {
                 return .blocked(
-                    title: title,
-                    subtitle: subtitle,
+                    title: repo.title,
+                    subtitle: repo.subtitle,
                     message: "Nothing to land — no applied branches in this workspace."
                 )
             }
-            return .ready(directory: directory, plan: plan)
+            return .ready(directory: repo.directory, plan: plan)
         } catch {
-            return .blocked(title: title, subtitle: subtitle, message: error.localizedDescription)
+            return .blocked(title: repo.title, subtitle: repo.subtitle, message: error.localizedDescription)
         }
     }
 
