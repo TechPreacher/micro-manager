@@ -138,10 +138,14 @@ public enum HerdrClient {
     ) async throws -> [String: Any] {
         try await withCheckedThrowingContinuation { continuation in
             let conn = SocketConnection(path: socketPath())
-            var finished = false
+            // `finish` races three threads — the socket read queue (response or
+            // close), the timeout queue, and the caller (open/encode failures).
+            // The continuation may resume exactly once, so the winner is picked
+            // under a lock; an unguarded flag here double-resumed when a
+            // response tied with the timeout.
+            let once = Once()
             let finish: (Result<[String: Any], Error>) -> Void = { result in
-                guard !finished else { return }
-                finished = true
+                guard once.claim() else { return }
                 conn.close()
                 continuation.resume(with: result)
             }
@@ -264,6 +268,20 @@ public enum HerdrClient {
     }
 }
 
+/// A latch that lets exactly one caller through, from any thread.
+final class Once: @unchecked Sendable {
+    private let lock = NSLock()
+    private var done = false
+
+    /// True for the first caller, false for everyone after.
+    func claim() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if done { return false }
+        done = true
+        return true
+    }
+}
+
 // MARK: - Event streams
 
 /// One subscription, on its own connection. The first line is the
@@ -275,6 +293,9 @@ public final class HerdrEventStream {
 
     private let subscriptions: [[String: Any]]
     private let conn: SocketConnection
+    /// Guards `ready` and `stopped`: the socket queue reads them while
+    /// `stop()` writes from whatever thread owns the stream.
+    private let stateLock = NSLock()
     private var ready = false
     private var stopped = false
 
@@ -286,19 +307,18 @@ public final class HerdrEventStream {
     @discardableResult
     public func start() -> HerdrEventStream {
         conn.onLine = { [weak self] line in
-            guard let self, !self.stopped else { return }
+            guard let self, !self.isStopped else { return }
             guard let data = line.data(using: .utf8),
                   let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             else { return }
-            if !self.ready {
-                self.ready = true
+            if self.claimFirstLine() {
                 DispatchQueue.main.async { self.onReady?() }
                 return
             }
             DispatchQueue.main.async { self.onEvent?(object) }
         }
         conn.onClosed = { [weak self] error in
-            guard let self, !self.stopped else { return }
+            guard let self, !self.isStopped else { return }
             DispatchQueue.main.async { self.onClosed?(error) }
         }
 
@@ -321,8 +341,23 @@ public final class HerdrEventStream {
     }
 
     public func stop() {
+        stateLock.lock()
         stopped = true
+        stateLock.unlock()
         conn.close()
+    }
+
+    private var isStopped: Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return stopped
+    }
+
+    /// True exactly once, for the acknowledgement line.
+    private func claimFirstLine() -> Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        if ready { return false }
+        ready = true
+        return true
     }
 
     deinit { conn.close() }
