@@ -85,12 +85,24 @@ public enum GitButler {
             return nil
         }
         // A profile that blocks — network mounts, a broken plugin manager —
-        // must not hang the first `but` lookup forever.
+        // must not hang the first `but` lookup forever. The read is bounded
+        // too: a daemon spawned by the profile can inherit the pipe's write
+        // end and hold it open long after the shell itself has exited.
         let watchdog = DispatchWorkItem { if process.isRunning { process.terminate() } }
         DispatchQueue.global().asyncAfter(deadline: .now() + 10, execute: watchdog)
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let collected = DataBox()
+        let reader = DispatchGroup()
+        DispatchQueue.global().async(group: reader) {
+            collected.value = pipe.fileHandleForReading.readDataToEndOfFile()
+        }
+        guard reader.wait(timeout: .now() + 12) == .success else {
+            kill(process.processIdentifier, SIGKILL)
+            watchdog.cancel()
+            return nil
+        }
         process.waitUntilExit()
         watchdog.cancel()
+        let data = collected.value ?? Data()
 
         let path = String(decoding: data, as: UTF8.self)
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -233,13 +245,26 @@ public enum GitButler {
         DispatchQueue.global().async(group: reader) {
             collected.value = pipe.fileHandleForReading.readDataToEndOfFile()
         }
-        _ = reader.wait(timeout: .now() + timeout + 4)
+        let readerOutcome = reader.wait(timeout: .now() + timeout + 4)
         process.waitUntilExit()
         watchdog.cancel()
 
-        if !timedOut.claim() {
+        // A watchdog firing just as the command exits cleanly is a race, not
+        // a timeout — only a process that actually died to the signal counts.
+        // A clean-but-signal-caught exit falls through to the ordinary
+        // succeeded/failed reporting below with whatever output it produced.
+        if !timedOut.claim(), process.terminationReason != .exit {
             throw Failure.commandFailed(
                 "`but \(arguments.first ?? "")` timed out after \(Int(timeout))s."
+            )
+        }
+
+        // The reader never reached EOF: something still holds the pipe.
+        // Empty text here must not read as success — `landPlan` would take
+        // it for "nothing to land" and report a silent all-clear.
+        if readerOutcome == .timedOut {
+            throw Failure.commandFailed(
+                "`but \(arguments.first ?? "")` finished, but something it spawned is still holding its output pipe."
             )
         }
 

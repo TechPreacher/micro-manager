@@ -51,6 +51,21 @@ final class KeymapProfileTests: XCTestCase {
                       "read and write must resolve the same profile")
     }
 
+    /// docs/hacking.md's reference reads `activeProfileId` positionally, so
+    /// when no profile carries the id, the positional reading is honoured
+    /// before falling back to the first profile.
+    func testUnmatchedIDFallsBackToThePosition() throws {
+        var config = reorderedConfig()
+        let profiles = config["profiles"] as! [[String: Any]]
+        var first = profiles[0]; first["id"] = 5
+        var second = profiles[1]; second["id"] = 3
+        config["profiles"] = [first, second]
+        config["activeProfileId"] = 1
+        let next = try KeymapManager.withAgentKeymap(config)
+        XCTAssertTrue(hasAgentBindings(keymap(ofProfileAt: 1, in: next)))
+        XCTAssertFalse(hasAgentBindings(keymap(ofProfileAt: 0, in: next)))
+    }
+
     func testUnknownActiveIDFallsBackToTheFirstProfile() throws {
         var config = reorderedConfig()
         config["activeProfileId"] = 99

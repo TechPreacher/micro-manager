@@ -88,7 +88,11 @@ public enum KeymapManager {
     static func activeProfileIndex(_ config: [String: Any]) -> Int {
         let active = config["activeProfileId"] as? Int ?? 0
         guard let profiles = config["profiles"] as? [[String: Any]] else { return 0 }
-        return profiles.firstIndex { ($0["id"] as? Int) == active } ?? 0
+        if let byID = profiles.firstIndex(where: { ($0["id"] as? Int) == active }) { return byID }
+        // No profile carries that id. docs/hacking.md's reference reads the
+        // value positionally, so honour that reading before giving up — on a
+        // stock pad (one profile, id 0) every interpretation agrees anyway.
+        return profiles.indices.contains(active) ? active : 0
     }
 
     /// `layer_index` from `device.status` is 1-based against this list, so the

@@ -51,12 +51,20 @@ final class HerdrStreamTests: XCTestCase {
     func testRejectedSubscriptionClosesWithTheError() throws {
         try serve { fd in
             FakeUnixServer.readLine(fd)
-            FakeUnixServer.write(fd, "{\"id\":\"wl_sub\",\"error\":{\"message\":\"unknown event type\"}}\n")
+            // The rejection and a trailing line in one packet: the trailing
+            // line is already buffered when the rejection closes the stream,
+            // and must be swallowed rather than surfaced as an event.
+            FakeUnixServer.write(
+                fd,
+                "{\"id\":\"wl_sub\",\"error\":{\"message\":\"unknown event type\"}}\n"
+                + "{\"type\":\"pane.created\"}\n"
+            )
         }
 
         let closed = expectation(description: "closed with the api error")
         let stream = HerdrEventStream(subscriptions: [["type": "bogus"]])
         stream.onReady = { XCTFail("a rejection is not an acknowledgement") }
+        stream.onEvent = { _ in XCTFail("no event may follow a rejection") }
         stream.onClosed = { error in
             guard case HerdrError.api(let message)? = error as? HerdrError else {
                 return XCTFail("expected HerdrError.api, got \(String(describing: error))")

@@ -75,11 +75,25 @@ final class AppServices: ObservableObject {
         }
     }
 
-    /// The pad must go dark before the process goes away.
+    /// The pad must go dark before the process goes away — but quit must not
+    /// hang behind a wedged lifecycle chain (a start mid-flight against an
+    /// unresponsive pad holds the chain through 8-second call timeouts), so
+    /// the wait is bounded: past the deadline the app quits with whatever
+    /// state the pad is in, which is no worse than the old immediate exit.
     func shutDown(completion: @escaping () -> Void) {
+        var replied = false
+        let finish = {
+            guard !replied else { return }
+            replied = true
+            completion()
+        }
         Task {
             await bridge.stop()
-            completion()
+            finish()
+        }
+        Task {
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            finish()
         }
     }
 }

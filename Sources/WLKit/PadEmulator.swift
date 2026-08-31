@@ -217,11 +217,12 @@ public final class PadEmulator: ObservableObject {
                 dict.values.forEach(scan)
             }
         }
-        // `activeProfileId` is an id, matched against each profile's own
-        // "id" — the same resolution KeymapManager uses.
+        // `activeProfileId` resolved the way KeymapManager does: by id first,
+        // positionally as the fallback.
         let active = keymap["activeProfileId"] as? Int ?? 0
         if let profiles = keymap["profiles"] as? [[String: Any]] {
-            let profile = profiles.first { ($0["id"] as? Int) == active } ?? profiles.first
+            let profile = profiles.first { ($0["id"] as? Int) == active }
+                ?? (profiles.indices.contains(active) ? profiles[active] : profiles.first)
             if let layers = profile?["layers"] as? [[String: Any]], let layer = layers.first {
                 scan(layer)
             }

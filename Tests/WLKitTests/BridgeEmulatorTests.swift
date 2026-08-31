@@ -65,6 +65,28 @@ final class BridgeEmulatorTests: XCTestCase {
         XCTAssertTrue(bridge.contendingClient)
     }
 
+    /// A sleepy Bluetooth pad answering after the 8-second timeout is still
+    /// our pad — the late reply must not raise the alarm.
+    func testLateReplyAfterTimeoutIsNotForeign() {
+        let bridge = BridgeController()
+        bridge.device.onTX?("fs.read", nil, 7)
+        bridge.device.onTimeout?(7)
+        bridge.device.onResponse?(7, ["data": "{}"], nil)
+        XCTAssertFalse(bridge.contendingClient)
+    }
+
+    /// A reconnect starts a fresh id conversation; entries from the dead
+    /// connection must not linger and absorb the new one's replies.
+    func testDisconnectClearsTheLedger() {
+        let bridge = BridgeController()
+        bridge.device.onTX?("sys.version", nil, 3)
+        bridge.device.onDisconnect?("gone")
+        // The old flight's id is forgotten; the new connection reuses it.
+        bridge.device.onTX?("sys.version", nil, 3)
+        bridge.device.onResponse?(3, ["ok": 1], nil)
+        XCTAssertFalse(bridge.contendingClient)
+    }
+
     // MARK: - Keymap verification
 
     /// The firmware answers {"ok":1} to a keymap it did not apply; the

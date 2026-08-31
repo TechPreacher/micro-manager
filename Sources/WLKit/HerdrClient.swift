@@ -317,6 +317,12 @@ public final class HerdrEventStream {
                 // bridge believing it has live events for a pane it does not.
                 if let error = object["error"] as? [String: Any] {
                     let message = error["message"] as? String ?? "subscription rejected"
+                    // Latch first: lines buffered behind the rejection in the
+                    // same packet would otherwise still come out as events on
+                    // a stream that just reported itself closed.
+                    self.stateLock.lock()
+                    self.stopped = true
+                    self.stateLock.unlock()
                     self.conn.close()
                     DispatchQueue.main.async { self.onClosed?(HerdrError.api(message)) }
                     return

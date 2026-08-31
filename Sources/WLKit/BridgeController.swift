@@ -83,8 +83,19 @@ public final class BridgeController: ObservableObject {
     /// clear. App-layer errors surfaced via `noteError` are not the poll's to
     /// erase — they stay until something replaces them.
     private var lastErrorIsTransient = false
+
+    /// The single writer for `lastError`: the transience flag decides whether
+    /// the next healthy poll may clear the message, so it must travel with
+    /// the message rather than be hand-paired at every assignment.
+    private func setLastError(_ message: String?, transient: Bool = true) {
+        lastError = message
+        lastErrorIsTransient = message == nil ? false : transient
+    }
     private var lastFingerprint: String?
     private var issuedIDs = Set<Int>()
+    /// Ids whose calls timed out. A late reply to one of these is still ours
+    /// — it must not raise the contending-client alarm.
+    private var timedOutIDs = Set<Int>()
     private var warnedPermission = false
 
     public init(config: BridgeConfig = BridgeConfig()) {
@@ -96,14 +107,23 @@ public final class BridgeController: ObservableObject {
     /// either way, so the bridge reconnects from scratch rather than trying to
     /// carry state across a transport it no longer has.
     public func useEmulator(_ on: Bool) async {
+        // On the same lifecycle chain as start/stop — the stop → swap → start
+        // sequence must not have a queued start() land in the middle of it
+        // and open the device this is about to throw away. The perform
+        // variants are called directly: a nested serialized{} would enqueue
+        // behind this very task and deadlock.
+        await serialized { await self.performUseEmulator(on) }
+    }
+
+    private func performUseEmulator(_ on: Bool) async {
         guard on != (emulator != nil) else { return }
         let wasRunning = isRunning
-        if wasRunning { await stop() }
+        if wasRunning { await performStop() }
         let pad = on ? PadEmulator() : nil
         emulator = pad
         device = WLDevice(emulator: pad)
         wire(device)
-        if wasRunning { await start() }
+        if wasRunning { await performStart() }
     }
 
     private func wire(_ device: WLDevice) {
@@ -111,21 +131,35 @@ public final class BridgeController: ObservableObject {
             guard let self else { return }
             self.deviceConnected = false
             self.lastFingerprint = nil
+            // Ids issued on a dead connection can never be answered on the
+            // next one; carrying them over masks real foreign replies.
+            self.issuedIDs.removeAll()
+            self.timedOutIDs.removeAll()
             if self.isRunning { self.scheduleReopen() }
         }
         device.onTX = { [weak self] _, _, id in
-            self?.issuedIDs.insert(id)
+            guard let self else { return }
+            self.issuedIDs.insert(id)
+            // The id is back in circulation; a reply now answers the new
+            // flight, not the long-dead one.
+            self.timedOutIDs.remove(id)
         }
         device.onResponse = { [weak self] id, _, _ in
             guard let self else { return }
-            // A reply to an id we never sent came from another client.
-            if self.issuedIDs.remove(id) == nil { self.contendingClient = true }
+            // A reply to an id we never sent came from another client — but a
+            // late answer to a call that merely timed out is still ours.
+            if self.issuedIDs.remove(id) != nil { return }
+            if self.timedOutIDs.remove(id) != nil { return }
+            self.contendingClient = true
         }
         device.onTimeout = { [weak self] id in
-            // The call gave up, so no reply will balance this id — drop it,
-            // or its stale entry eventually misattributes a reused id and a
-            // real reply raises a phantom contending-client alarm.
-            self?.issuedIDs.remove(id)
+            // The call gave up — move the id to the timed-out ledger rather
+            // than forgetting it: a genuine reply landing after the timeout
+            // (a sleepy Bluetooth pad answering at 9s) must not read as a
+            // foreign client, and a stale entry left in `issuedIDs` would
+            // misattribute the id's next reuse.
+            guard let self else { return }
+            if self.issuedIDs.remove(id) != nil { self.timedOutIDs.insert(id) }
         }
         device.onNotification = { [weak self] method, params in
             guard let self, method == OAI.notifyHID else { return }
@@ -167,7 +201,7 @@ public final class BridgeController: ObservableObject {
     private func performStart() async {
         guard !isRunning else { return }
         isRunning = true
-        lastError = nil
+        setLastError(nil)
         contendingClient = false
         keyBindings = KeyBindings.load()
 
@@ -229,7 +263,7 @@ public final class BridgeController: ObservableObject {
             permissionDenied = false
             warnedPermission = false
             deviceName = device.info?.product ?? "Work Louder device"
-            lastError = nil
+            setLastError(nil)
         } catch {
             deviceConnected = false
             // Match the typed error, not the message text: several unrelated
@@ -238,12 +272,13 @@ public final class BridgeController: ObservableObject {
                 permissionDenied = true
                 if !warnedPermission {
                     warnedPermission = true
-                    lastError = error.localizedDescription
-                    lastErrorIsTransient = true
+                    // Sticky: this message is set exactly once per session,
+                    // so a healthy Herdr poll clearing it would leave a dark
+                    // pad with no explanation in the menu.
+                    setLastError(error.localizedDescription, transient: false)
                 }
             } else {
-                lastError = error.localizedDescription
-                lastErrorIsTransient = true
+                setLastError(error.localizedDescription)
             }
             scheduleReopen()
             return
@@ -276,14 +311,12 @@ public final class BridgeController: ObservableObject {
                 let cfg = try await KeymapManager.read(device)
                 keymapReady = KeymapManager.isAgentKeymapApplied(cfg)
                 if !keymapReady {
-                    lastError = "The agent keys and the stack key are not bound to KV_OAI_AG00..AG06, so per-key colours will do nothing."
-                    lastErrorIsTransient = true
+                    setLastError("The agent keys and the stack key are not bound to KV_OAI_AG00..AG06, so per-key colours will do nothing.")
                 }
             }
         } catch {
             keymapReady = false
-            lastError = "Keymap: \(error.localizedDescription)"
-            lastErrorIsTransient = true
+            setLastError("Keymap: \(error.localizedDescription)")
         }
     }
 
@@ -375,17 +408,13 @@ public final class BridgeController: ObservableObject {
         do {
             fetched = try await HerdrClient.listAgents()
         } catch {
-            lastError = error.localizedDescription
-            lastErrorIsTransient = true
+            setLastError(error.localizedDescription)
             return
         }
         // Clear only errors the poll itself may outdate — a voice or tune
         // failure noted from the app layer would otherwise vanish within one
         // poll interval, before anyone opened the menu.
-        if lastErrorIsTransient {
-            lastError = nil
-            lastErrorIsTransient = false
-        }
+        if lastErrorIsTransient { setLastError(nil) }
         agents = fetched
         reconcileStatusStreams(fetched)
 
@@ -447,8 +476,7 @@ public final class BridgeController: ObservableObject {
                 )
             )
         } catch {
-            lastError = error.localizedDescription
-            lastErrorIsTransient = true
+            setLastError(error.localizedDescription)
             lastFingerprint = nil   // repaint on the next tick
         }
     }
@@ -502,14 +530,12 @@ public final class BridgeController: ObservableObject {
             guard let agent = try await HerdrClient.focusedAgent(),
                   let pane = agent.paneID
             else {
-                lastError = "Nothing has focus in Herdr right now."
-                lastErrorIsTransient = true
+                setLastError("Nothing has focus in Herdr right now.")
                 return
             }
             try await HerdrClient.sendText(paneID: pane, text: text)
         } catch {
-            lastError = error.localizedDescription
-            lastErrorIsTransient = true
+            setLastError(error.localizedDescription)
         }
     }
 
@@ -523,8 +549,7 @@ public final class BridgeController: ObservableObject {
     /// Lets app-layer features that fail outside the bridge surface their
     /// error where the menu already shows the bridge's own.
     public func noteError(_ message: String) {
-        lastError = message
-        lastErrorIsTransient = false
+        setLastError(message, transient: false)
     }
 
     /// Advances the focused workspace to its next tab, wrapping.
@@ -532,8 +557,7 @@ public final class BridgeController: ObservableObject {
         do {
             try await HerdrClient.cycleTabs()
         } catch {
-            lastError = error.localizedDescription
-            lastErrorIsTransient = true
+            setLastError(error.localizedDescription)
         }
     }
 
@@ -566,8 +590,7 @@ public final class BridgeController: ObservableObject {
             try await HerdrClient.focusAgent(target)
             raiseTerminal()
         } catch {
-            lastError = error.localizedDescription
-            lastErrorIsTransient = true
+            setLastError(error.localizedDescription)
         }
     }
 
