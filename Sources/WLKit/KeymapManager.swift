@@ -81,12 +81,21 @@ public enum KeymapManager {
         return config
     }
 
+    /// The array position of the profile `activeProfileId` names. The id is
+    /// an id, not a position — deleted or reordered profiles make the two
+    /// diverge, and writing by position would flash the wrong profile while a
+    /// read-back using the same wrong lookup happily verified it.
+    static func activeProfileIndex(_ config: [String: Any]) -> Int {
+        let active = config["activeProfileId"] as? Int ?? 0
+        guard let profiles = config["profiles"] as? [[String: Any]] else { return 0 }
+        return profiles.firstIndex { ($0["id"] as? Int) == active } ?? 0
+    }
+
     /// `layer_index` from `device.status` is 1-based against this list, so the
     /// active layer is the first one.
     static func activeLayerKeymap(_ config: [String: Any]) -> [[String]]? {
-        let index = config["activeProfileId"] as? Int ?? 0
         guard let profiles = config["profiles"] as? [[String: Any]] else { return nil }
-        let profile = index < profiles.count ? profiles[index] : profiles.first
+        let profile = profiles[safe: activeProfileIndex(config)]
         guard let layers = profile?["layers"] as? [[String: Any]],
               let layer = layers.first,
               let layout = layer["layout"] as? [String: Any],
@@ -96,9 +105,8 @@ public enum KeymapManager {
     }
 
     static func activeLayerLayout(_ config: [String: Any]) -> [String: Any]? {
-        let index = config["activeProfileId"] as? Int ?? 0
         guard let profiles = config["profiles"] as? [[String: Any]] else { return nil }
-        let profile = index < profiles.count ? profiles[index] : profiles.first
+        let profile = profiles[safe: activeProfileIndex(config)]
         guard let layers = profile?["layers"] as? [[String: Any]],
               let layer = layers.first
         else { return nil }
@@ -142,11 +150,13 @@ public enum KeymapManager {
     /// joystick and lighting setting untouched.
     public static func withAgentKeymap(_ config: [String: Any]) throws -> [String: Any] {
         var next = config
-        let index = next["activeProfileId"] as? Int ?? 0
         guard var profiles = next["profiles"] as? [[String: Any]], !profiles.isEmpty else {
             throw Failure.noProfiles
         }
-        let profileIndex = index < profiles.count ? index : 0
+        // Resolved by id, and by the same resolver the read path uses — the
+        // write and its verification must never disagree about which profile
+        // is active.
+        let profileIndex = activeProfileIndex(next)
         var profile = profiles[profileIndex]
         guard var layers = profile["layers"] as? [[String: Any]], !layers.isEmpty else {
             throw Failure.noProfiles
@@ -218,5 +228,11 @@ public enum KeymapManager {
         let after = try await read(device)
         guard isAgentKeymapApplied(after) else { throw Failure.notAccepted }
         return true
+    }
+}
+
+private extension Array {
+    subscript(safe index: Int) -> Element? {
+        indices.contains(index) ? self[index] : nil
     }
 }

@@ -51,7 +51,9 @@ public enum GitButler {
         return found
     }
 
-    private static func searchForBinary() -> String? {
+    /// Internal rather than private so the tests can exercise the search
+    /// order without going through the cache.
+    static func searchForBinary() -> String? {
         let environment = ProcessInfo.processInfo.environment
         if let explicit = environment["WL_BUT_PATH"], !explicit.isEmpty,
            FileManager.default.isExecutableFile(atPath: explicit) {
