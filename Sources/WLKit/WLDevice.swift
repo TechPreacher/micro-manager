@@ -85,6 +85,10 @@ public final class WLDevice {
     // Callbacks, always delivered on the main queue.
     public var onTX: ((String, Any?, Int) -> Void)?          // method, params, id
     public var onResponse: ((Int, Any?, String?) -> Void)?   // id, result, errorMessage
+    /// A pending call gave up waiting. Whoever tracks issued ids needs this,
+    /// or ids that never get a reply pile up as false "contending client"
+    /// evidence.
+    public var onTimeout: ((Int) -> Void)?
     public var onNotification: ((String, Any?) -> Void)?     // method, params
     public var onDeviceLog: ((String) -> Void)?
     public var onWriteError: ((String, String) -> Void)?
@@ -301,6 +305,7 @@ public final class WLDevice {
             pending[id] = completion
             DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
                 guard let self, let waiting = self.pending.removeValue(forKey: id) else { return }
+                self.onTimeout?(id)
                 waiting(nil, Failure.timeout(method).errorDescription)
             }
         }

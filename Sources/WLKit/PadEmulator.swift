@@ -46,6 +46,11 @@ public final class PadEmulator: ObservableObject {
     /// Set by `WLDevice` to deliver device-pushed notifications.
     var onNotify: ((String, Any?) -> Void)?
 
+    /// When set, `fs.write` answers `{"ok":1}` but keeps the old keymap — the
+    /// firmware-that-lies scenario `KeymapManager.apply`'s read-back check
+    /// exists to catch.
+    public var ignoreWrites = false
+
     private var keymap: [String: Any] = PadEmulator.stockKeymap()
 
     public init() { refreshBinding() }
@@ -88,6 +93,10 @@ public final class PadEmulator: ObservableObject {
                   let object = try? JSONSerialization.jsonObject(with: Data(text.utf8)),
                   let config = object as? [String: Any]
             else { return (nil, "bad payload") }
+            guard !ignoreWrites else {
+                note("fs.write keymap.json — accepted and ignored")
+                return (["ok": 1], nil)
+            }
             keymap = config
             refreshBinding()
             note("fs.write keymap.json — \(bound.count) keys now bound")

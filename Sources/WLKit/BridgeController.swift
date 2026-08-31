@@ -67,7 +67,9 @@ public final class BridgeController: ObservableObject {
 
     // MARK: - Internals
 
-    private var device = WLDevice()
+    /// Internal rather than private for the tests, which need to feed the
+    /// device callbacks directly.
+    var device = WLDevice()
     /// Non-nil while the bridge is driving a virtual pad instead of hardware.
     @Published public private(set) var emulator: PadEmulator?
     private var lifecycle: HerdrEventStream?
@@ -75,6 +77,12 @@ public final class BridgeController: ObservableObject {
     private var pollTask: Task<Void, Never>?
     private var debounceTask: Task<Void, Never>?
     private var reopenTask: Task<Void, Never>?
+    private var reopenGeneration = 0
+    private var lifecycleTask: Task<Void, Never>?
+    /// True while `lastError` carries a message the next healthy poll may
+    /// clear. App-layer errors surfaced via `noteError` are not the poll's to
+    /// erase — they stay until something replaces them.
+    private var lastErrorIsTransient = false
     private var lastFingerprint: String?
     private var issuedIDs = Set<Int>()
     private var warnedPermission = false
@@ -113,6 +121,12 @@ public final class BridgeController: ObservableObject {
             // A reply to an id we never sent came from another client.
             if self.issuedIDs.remove(id) == nil { self.contendingClient = true }
         }
+        device.onTimeout = { [weak self] id in
+            // The call gave up, so no reply will balance this id — drop it,
+            // or its stale entry eventually misattributes a reused id and a
+            // real reply raises a phantom contending-client alarm.
+            self?.issuedIDs.remove(id)
+        }
         device.onNotification = { [weak self] method, params in
             guard let self, method == OAI.notifyHID else { return }
             guard let dict = params as? [String: Any] else { return }
@@ -129,6 +143,28 @@ public final class BridgeController: ObservableObject {
     }
 
     public func start() async {
+        await serialized { await self.performStart() }
+    }
+
+    public func stop() async {
+        await serialized { await self.performStop() }
+    }
+
+    /// `performStart`/`performStop` suspend mid-flight — device round-trips
+    /// with 8-second timeouts — so a fast toggle could interleave them and
+    /// strand the bridge marked running with a disconnected device. Chain the
+    /// transitions instead: each waits out its predecessor.
+    private func serialized(_ operation: @escaping () async -> Void) async {
+        let previous = lifecycleTask
+        let task = Task { [previous] in
+            await previous?.value
+            await operation()
+        }
+        lifecycleTask = task
+        await task.value
+    }
+
+    private func performStart() async {
         guard !isRunning else { return }
         isRunning = true
         lastError = nil
@@ -150,7 +186,7 @@ public final class BridgeController: ObservableObject {
         }
     }
 
-    public func stop() async {
+    private func performStop() async {
         isRunning = false
         pollTask?.cancel(); pollTask = nil
         debounceTask?.cancel(); debounceTask = nil
@@ -196,12 +232,18 @@ public final class BridgeController: ObservableObject {
             lastError = nil
         } catch {
             deviceConnected = false
-            let message = error.localizedDescription
-            if message.contains("0xE00002C1") || message.contains("Input Monitoring") {
+            // Match the typed error, not the message text: several unrelated
+            // failure strings also mention Input Monitoring.
+            if case WLDevice.Failure.openFailed(let code) = error, code == kIOReturnNotPrivileged {
                 permissionDenied = true
-                if !warnedPermission { warnedPermission = true; lastError = message }
+                if !warnedPermission {
+                    warnedPermission = true
+                    lastError = error.localizedDescription
+                    lastErrorIsTransient = true
+                }
             } else {
-                lastError = message
+                lastError = error.localizedDescription
+                lastErrorIsTransient = true
             }
             scheduleReopen()
             return
@@ -235,20 +277,24 @@ public final class BridgeController: ObservableObject {
                 keymapReady = KeymapManager.isAgentKeymapApplied(cfg)
                 if !keymapReady {
                     lastError = "The agent keys and the stack key are not bound to KV_OAI_AG00..AG06, so per-key colours will do nothing."
+                    lastErrorIsTransient = true
                 }
             }
         } catch {
             keymapReady = false
             lastError = "Keymap: \(error.localizedDescription)"
+            lastErrorIsTransient = true
         }
     }
 
     private func scheduleReopen() {
         guard isRunning, reopenTask == nil else { return }
+        reopenGeneration += 1
+        let generation = reopenGeneration
         reopenTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 3_000_000_000)
-                guard let self, self.isRunning else { return }
+                guard let self, self.isRunning else { break }
                 if self.deviceConnected { break }
                 await self.openDevice()
                 if self.deviceConnected {
@@ -256,7 +302,9 @@ public final class BridgeController: ObservableObject {
                     break
                 }
             }
-            self?.reopenTask = nil
+            // Only clear our own handle: a cancelled loop resuming late must
+            // not wipe the reference to a successor and let a third loop in.
+            if let self, self.reopenGeneration == generation { self.reopenTask = nil }
         }
     }
 
@@ -328,9 +376,16 @@ public final class BridgeController: ObservableObject {
             fetched = try await HerdrClient.listAgents()
         } catch {
             lastError = error.localizedDescription
+            lastErrorIsTransient = true
             return
         }
-        lastError = nil
+        // Clear only errors the poll itself may outdate — a voice or tune
+        // failure noted from the app layer would otherwise vanish within one
+        // poll interval, before anyone opened the menu.
+        if lastErrorIsTransient {
+            lastError = nil
+            lastErrorIsTransient = false
+        }
         agents = fetched
         reconcileStatusStreams(fetched)
 
@@ -393,6 +448,7 @@ public final class BridgeController: ObservableObject {
             )
         } catch {
             lastError = error.localizedDescription
+            lastErrorIsTransient = true
             lastFingerprint = nil   // repaint on the next tick
         }
     }
@@ -447,11 +503,13 @@ public final class BridgeController: ObservableObject {
                   let pane = agent.paneID
             else {
                 lastError = "Nothing has focus in Herdr right now."
+                lastErrorIsTransient = true
                 return
             }
             try await HerdrClient.sendText(paneID: pane, text: text)
         } catch {
             lastError = error.localizedDescription
+            lastErrorIsTransient = true
         }
     }
 
@@ -466,6 +524,7 @@ public final class BridgeController: ObservableObject {
     /// error where the menu already shows the bridge's own.
     public func noteError(_ message: String) {
         lastError = message
+        lastErrorIsTransient = false
     }
 
     /// Advances the focused workspace to its next tab, wrapping.
@@ -474,6 +533,7 @@ public final class BridgeController: ObservableObject {
             try await HerdrClient.cycleTabs()
         } catch {
             lastError = error.localizedDescription
+            lastErrorIsTransient = true
         }
     }
 
@@ -507,6 +567,7 @@ public final class BridgeController: ObservableObject {
             raiseTerminal()
         } catch {
             lastError = error.localizedDescription
+            lastErrorIsTransient = true
         }
     }
 
