@@ -179,8 +179,11 @@ public final class BridgeController: ObservableObject {
     private func openDevice() async {
         // Ask for Input Monitoring explicitly. hidapi-style opens just fail
         // with a privilege violation without ever raising the prompt, which
-        // reads as a bug rather than a permission.
-        if IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) != kIOHIDAccessTypeGranted {
+        // reads as a bug rather than a permission. An emulated pad never
+        // touches IOKit, so it must not raise the prompt either — tests and CI
+        // run through that path.
+        if device.emulator == nil,
+           IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) != kIOHIDAccessTypeGranted {
             _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
         }
 
