@@ -111,7 +111,14 @@ public final class WLDevice {
 
     public init(emulator: PadEmulator? = nil) { self.emulator = emulator }
 
-    deinit { inputBuffer.deallocate() }
+    // Disconnect before the buffer goes: the input-report callback registered
+    // with IOKit points at `inputBuffer` and at an unretained `self`, so a
+    // WLDevice released while open would leave IOKit writing into freed memory
+    // and calling back into a freed object.
+    deinit {
+        disconnect(reason: nil)
+        inputBuffer.deallocate()
+    }
 
     // MARK: - Connect
 
@@ -201,14 +208,25 @@ public final class WLDevice {
             if let reason { onDisconnect?(reason) }
             return
         }
+        // The manager is torn down whether or not a device was chosen: a
+        // failed connect() leaves it open with `device` still nil, and the
+        // 3-second reconnect loop would otherwise leak one opened manager —
+        // mach ports and all — per attempt.
+        defer {
+            if let mgr = manager {
+                IOHIDManagerClose(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
+                manager = nil
+            }
+        }
         guard let dev = device else { return }
+        // Detach the callbacks before closing: they hold this instance
+        // unretained and the input callback writes into `inputBuffer`, so
+        // leaving them registered turns the next report into a use-after-free.
+        IOHIDDeviceRegisterInputReportCallback(dev, inputBuffer, WLDevice.reportSize, nil, nil)
+        IOHIDDeviceRegisterRemovalCallback(dev, nil, nil)
         IOHIDDeviceUnscheduleFromRunLoop(dev, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
         IOHIDDeviceClose(dev, IOOptionBits(kIOHIDOptionsTypeNone))
         device = nil
-        if let mgr = manager {
-            IOHIDManagerClose(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
-            manager = nil
-        }
         info = nil
         rpcAccumulator = ""
         debugAccumulator = ""
