@@ -171,6 +171,10 @@ final class FakeUnixServer {
             while true {
                 let client = accept(listenFD, nil, nil)
                 guard client >= 0 else { break }
+                // The server runs inside the test process: a client hanging
+                // up mid-write must error, not SIGPIPE the whole test run.
+                var noSigpipe: Int32 = 1
+                setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &noSigpipe, socklen_t(MemoryLayout<Int32>.size))
                 queue.async { handler(client) }
             }
         }

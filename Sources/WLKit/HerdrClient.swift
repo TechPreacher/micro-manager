@@ -312,6 +312,15 @@ public final class HerdrEventStream {
                   let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             else { return }
             if self.claimFirstLine() {
+                // The first line acknowledges the subscription — unless it is
+                // a rejection. Treating a rejection as an ack would leave the
+                // bridge believing it has live events for a pane it does not.
+                if let error = object["error"] as? [String: Any] {
+                    let message = error["message"] as? String ?? "subscription rejected"
+                    self.conn.close()
+                    DispatchQueue.main.async { self.onClosed?(HerdrError.api(message)) }
+                    return
+                }
                 DispatchQueue.main.async { self.onReady?() }
                 return
             }
@@ -372,6 +381,9 @@ final class SocketConnection: @unchecked Sendable {
     var onLine: ((String) -> Void)?
     var onClosed: ((Error?) -> Void)?
 
+    /// No Herdr line comes anywhere near this; only a misbehaving peer does.
+    static let maxLineBytes = 1_048_576
+
     private let path: String
     private var fd: Int32 = -1
     private let queue = DispatchQueue(label: "cc.worklouder.herdr-socket")
@@ -386,6 +398,11 @@ final class SocketConnection: @unchecked Sendable {
         guard handle >= 0 else {
             throw HerdrError.cannotConnect(path, String(cString: strerror(errno)))
         }
+        // The protocol is one-request-per-connection, so the peer closes
+        // aggressively — writing into a just-closed socket without this
+        // raises SIGPIPE, whose default disposition kills the process.
+        var noSigpipe: Int32 = 1
+        setsockopt(handle, SOL_SOCKET, SO_NOSIGPIPE, &noSigpipe, socklen_t(MemoryLayout<Int32>.size))
 
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
@@ -421,6 +438,10 @@ final class SocketConnection: @unchecked Sendable {
             var sent = 0
             while sent < raw.count {
                 let n = Darwin.write(fd, raw.baseAddress!.advanced(by: sent), raw.count - sent)
+                if n < 0, errno == EINTR || errno == EAGAIN { continue }
+                // Any other failure: stop writing and let the read loop
+                // notice the dead peer — a truncated request would otherwise
+                // just look like a server that never answers.
                 if n <= 0 { break }
                 sent += n
             }
@@ -443,17 +464,21 @@ final class SocketConnection: @unchecked Sendable {
             guard handle >= 0 else { break }
 
             let n = Darwin.read(handle, &chunk, chunk.count)
+            if n < 0, errno == EINTR { continue }
             if n <= 0 { break }
             buffer.append(contentsOf: chunk[0..<n])
 
             while let index = buffer.firstIndex(of: UInt8(ascii: "\n")) {
                 let lineData = buffer.prefix(upTo: index)
-                buffer = buffer.suffix(from: buffer.index(after: index))
+                buffer.removeSubrange(...index)
                 if let line = String(data: lineData, encoding: .utf8)?
                     .trimmingCharacters(in: .whitespacesAndNewlines), !line.isEmpty {
                     onLine?(line)
                 }
             }
+            // A line that never ends is not Herdr — drop the connection
+            // rather than hold an unbounded buffer for it.
+            if buffer.count > SocketConnection.maxLineBytes { break }
         }
         lock.lock(); let wasClosed = closed; lock.unlock()
         if !wasClosed { onClosed?(nil) }
