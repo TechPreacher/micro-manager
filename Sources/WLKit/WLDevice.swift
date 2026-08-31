@@ -102,8 +102,14 @@ public final class WLDevice {
     private var manager: IOHIDManager?
     private var device: IOHIDDevice?
     private var inputBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: reportSize)
-    private var rpcAccumulator = ""
-    private var debugAccumulator = ""
+    // Raw bytes, not String: a multi-byte character regularly straddles the
+    // 61-byte report boundary, and converting per-fragment dropped the report
+    // whose tail was a half codepoint — poisoning every message after it.
+    private var rpcAccumulator = [UInt8]()
+    private var debugAccumulator = [UInt8]()
+
+    /// Test seam: how much undrained RPC input is being held.
+    var rpcBacklogBytes: Int { rpcAccumulator.count }
     private var pending: [Int: (Any?, String?) -> Void] = [:]
     private var nextID = 1
 
@@ -228,8 +234,8 @@ public final class WLDevice {
         IOHIDDeviceClose(dev, IOOptionBits(kIOHIDOptionsTypeNone))
         device = nil
         info = nil
-        rpcAccumulator = ""
-        debugAccumulator = ""
+        rpcAccumulator = []
+        debugAccumulator = []
         for (_, done) in pending { done(nil, "disconnected") }
         pending.removeAll()
         if let reason { onDisconnect?(reason) }
@@ -275,16 +281,7 @@ public final class WLDevice {
             return nil
         }
 
-        let payload = [UInt8](data)
-        var offset = 0
-        while offset < payload.count {
-            let n = min(WLDevice.maxChunk, payload.count - offset)
-            var report = [UInt8](repeating: 0, count: WLDevice.reportSize)
-            report[0] = WLDevice.reportID
-            report[1] = WLDevice.channelRPC
-            report[2] = UInt8(n)
-            report.replaceSubrange(3..<(3 + n), with: payload[offset..<(offset + n)])
-
+        for report in WLDevice.frames(for: [UInt8](data)) {
             let rc = report.withUnsafeBufferPointer { buf in
                 IOHIDDeviceSetReport(dev, kIOHIDReportTypeOutput, CFIndex(WLDevice.reportID), buf.baseAddress!, buf.count)
             }
@@ -296,7 +293,6 @@ public final class WLDevice {
                 completion?(nil, message)
                 return nil
             }
-            offset += n
         }
 
         onTX?(method, params, id)
@@ -311,7 +307,32 @@ public final class WLDevice {
         return id
     }
 
+    /// The zero-padded 64-byte output reports that carry `payload` on the RPC
+    /// channel, 61 payload bytes per report.
+    static func frames(for payload: [UInt8]) -> [[UInt8]] {
+        var frames: [[UInt8]] = []
+        var offset = 0
+        while offset < payload.count {
+            let n = min(maxChunk, payload.count - offset)
+            var report = [UInt8](repeating: 0, count: reportSize)
+            report[0] = reportID
+            report[1] = channelRPC
+            report[2] = UInt8(n)
+            report.replaceSubrange(3..<(3 + n), with: payload[offset..<(offset + n)])
+            frames.append(report)
+            offset += n
+        }
+        return frames
+    }
+
     // MARK: - Receive
+
+    /// Test seam: one raw input report through the exact path the IOKit
+    /// callback uses. The framing layer is otherwise unreachable without
+    /// hardware — the emulator answers above it.
+    func ingest(report bytes: [UInt8]) {
+        handleReport(bytes, reportID: UInt32(WLDevice.reportID))
+    }
 
     private func handleReport(_ bytes: [UInt8], reportID: UInt32) {
         onRawReport?(reportID, bytes)
@@ -329,22 +350,24 @@ public final class WLDevice {
         guard length > 0, length <= WLDevice.maxChunk, bytes.count >= offset + 2 + length else { return false }
 
         let slice = Array(bytes[(offset + 2)..<(offset + 2 + length)])
-        guard let text = String(bytes: slice, encoding: .utf8) else { return false }
 
         if channel == WLDevice.channelDebug {
-            debugAccumulator += text
-            while let idx = debugAccumulator.firstIndex(where: { $0 == "\n" || $0 == "\r" }) {
-                let line = String(debugAccumulator[..<idx]).trimmingCharacters(in: .whitespacesAndNewlines)
-                debugAccumulator = String(debugAccumulator[debugAccumulator.index(after: idx)...])
-                if !line.isEmpty { onDeviceLog?(line) }
+            debugAccumulator += slice
+            while let idx = debugAccumulator.firstIndex(where: { $0 == 0x0A || $0 == 0x0D }) {
+                let lineBytes = debugAccumulator[..<idx]
+                debugAccumulator.removeSubrange(...idx)
+                if let line = String(bytes: lineBytes, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines), !line.isEmpty {
+                    onDeviceLog?(line)
+                }
             }
-            if debugAccumulator.count > 4096 { debugAccumulator = "" }
+            if debugAccumulator.count > 4096 { debugAccumulator = [] }
             return true
         }
 
-        rpcAccumulator += text
+        rpcAccumulator += slice
         drainRPC()
-        if rpcAccumulator.count > 8192 { rpcAccumulator = "" }
+        if rpcAccumulator.count > 8192 { rpcAccumulator = [] }
         return true
     }
 
@@ -352,8 +375,7 @@ public final class WLDevice {
     private func drainRPC() {
         while let object = nextJSONObject() {
             guard
-                let data = object.data(using: .utf8),
-                let decoded = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                let decoded = try? JSONSerialization.jsonObject(with: Data(object)) as? [String: Any]
             else { continue }
 
             if let id = decoded["id"] as? Int {
@@ -371,36 +393,35 @@ public final class WLDevice {
         }
     }
 
-    private func nextJSONObject() -> String? {
+    // Scanning bytes is UTF-8-safe here: every byte that matters — brace,
+    // quote, backslash — is ASCII, and UTF-8 continuation bytes can never
+    // collide with ASCII values.
+    private func nextJSONObject() -> [UInt8]? {
         var depth = 0
-        var start: String.Index?
+        var start: Int?
         var inString = false
         var escaped = false
-        var index = rpcAccumulator.startIndex
+        let quote = UInt8(ascii: "\""), backslash = UInt8(ascii: "\\")
+        let openBrace = UInt8(ascii: "{"), closeBrace = UInt8(ascii: "}")
 
-        while index < rpcAccumulator.endIndex {
-            let ch = rpcAccumulator[index]
+        for (index, byte) in rpcAccumulator.enumerated() {
             if inString {
                 if escaped { escaped = false }
-                else if ch == "\\" { escaped = true }
-                else if ch == "\"" { inString = false }
-            } else if ch == "\"" {
+                else if byte == backslash { escaped = true }
+                else if byte == quote { inString = false }
+            } else if byte == quote {
                 inString = true
-            } else if ch == "{" {
+            } else if byte == openBrace {
                 if depth == 0 { start = index }
                 depth += 1
-            } else if ch == "}" {
-                if depth > 0 {
-                    depth -= 1
-                    if depth == 0, let s = start {
-                        let end = rpcAccumulator.index(after: index)
-                        let object = String(rpcAccumulator[s..<end])
-                        rpcAccumulator = String(rpcAccumulator[end...])
-                        return object
-                    }
+            } else if byte == closeBrace, depth > 0 {
+                depth -= 1
+                if depth == 0, let s = start {
+                    let object = Array(rpcAccumulator[s...index])
+                    rpcAccumulator.removeSubrange(...index)
+                    return object
                 }
             }
-            index = rpcAccumulator.index(after: index)
         }
         return nil
     }
