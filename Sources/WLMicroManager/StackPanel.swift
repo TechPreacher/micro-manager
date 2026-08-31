@@ -74,43 +74,25 @@ final class StackPanelController {
     }
 
     private static func buildPayload() async -> Payload {
-        let agent: HerdrAgent?
-        do {
-            agent = try await HerdrClient.focusedAgent()
-        } catch {
+        let repo: FocusedRepo.Resolved
+        switch await FocusedRepo.resolve() {
+        case .failure(let blocked):
             return Payload(
-                title: "Herdr",
-                subtitle: "",
-                body: PanelHTML.note(error.localizedDescription)
+                title: blocked.title,
+                subtitle: blocked.subtitle,
+                body: PanelHTML.note(blocked.message)
             )
-        }
-
-        guard let agent else {
-            return Payload(
-                title: "No focused agent",
-                subtitle: "",
-                body: PanelHTML.note("Nothing has focus in Herdr right now.")
-            )
-        }
-        guard let directory = agent.workingDirectory else {
-            return Payload(
-                title: agent.shortName,
-                subtitle: "",
-                body: PanelHTML.note("Herdr did not report a working directory for this agent.")
-            )
+        case .success(let resolved):
+            repo = resolved
         }
 
         do {
-            let output = try await GitButler.status(in: directory)
-            return Payload(
-                title: (directory as NSString).lastPathComponent,
-                subtitle: PanelHTML.abbreviate(directory),
-                body: PanelHTML.output(output)
-            )
+            let output = try await GitButler.status(in: repo.directory)
+            return Payload(title: repo.title, subtitle: repo.subtitle, body: PanelHTML.output(output))
         } catch {
             return Payload(
-                title: (directory as NSString).lastPathComponent,
-                subtitle: PanelHTML.abbreviate(directory),
+                title: repo.title,
+                subtitle: repo.subtitle,
                 body: PanelHTML.note(error.localizedDescription)
             )
         }

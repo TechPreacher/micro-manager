@@ -212,14 +212,17 @@ struct EmulatorView: View {
                     VStack(alignment: .leading, spacing: 1) {
                         // Identity is the line's lifetime number, which stays
                         // stable as the ring buffer drops old lines — an
-                        // array offset shifts under every removeFirst.
+                        // array offset shifts under every removeFirst, making
+                        // SwiftUI rebuild all 80 rows per appended line.
                         let base = emulator.trafficTotal - emulator.traffic.count
-                        ForEach(Array(emulator.traffic.enumerated()), id: \.offset) { index, line in
-                            Text(line)
+                        let numbered = emulator.traffic.enumerated()
+                            .map { (number: base + $0.offset, line: $0.element) }
+                        ForEach(numbered, id: \.number) { entry in
+                            Text(entry.line)
                                 .font(.system(size: 10, design: .monospaced))
                                 .foregroundStyle(.secondary)
                                 .frame(maxWidth: .infinity, alignment: .leading)
-                                .id(base + index)
+                                .id(entry.number)
                         }
                     }
                 }
