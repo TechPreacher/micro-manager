@@ -138,10 +138,14 @@ public enum HerdrClient {
     ) async throws -> [String: Any] {
         try await withCheckedThrowingContinuation { continuation in
             let conn = SocketConnection(path: socketPath())
-            var finished = false
+            // `finish` races three threads — the socket read queue (response or
+            // close), the timeout queue, and the caller (open/encode failures).
+            // The continuation may resume exactly once, so the winner is picked
+            // under a lock; an unguarded flag here double-resumed when a
+            // response tied with the timeout.
+            let once = Once()
             let finish: (Result<[String: Any], Error>) -> Void = { result in
-                guard !finished else { return }
-                finished = true
+                guard once.claim() else { return }
                 conn.close()
                 continuation.resume(with: result)
             }
@@ -264,6 +268,20 @@ public enum HerdrClient {
     }
 }
 
+/// A latch that lets exactly one caller through, from any thread.
+final class Once: @unchecked Sendable {
+    private let lock = NSLock()
+    private var done = false
+
+    /// True for the first caller, false for everyone after.
+    func claim() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if done { return false }
+        done = true
+        return true
+    }
+}
+
 // MARK: - Event streams
 
 /// One subscription, on its own connection. The first line is the
@@ -275,6 +293,9 @@ public final class HerdrEventStream {
 
     private let subscriptions: [[String: Any]]
     private let conn: SocketConnection
+    /// Guards `ready` and `stopped`: the socket queue reads them while
+    /// `stop()` writes from whatever thread owns the stream.
+    private let stateLock = NSLock()
     private var ready = false
     private var stopped = false
 
@@ -286,19 +307,33 @@ public final class HerdrEventStream {
     @discardableResult
     public func start() -> HerdrEventStream {
         conn.onLine = { [weak self] line in
-            guard let self, !self.stopped else { return }
+            guard let self, !self.isStopped else { return }
             guard let data = line.data(using: .utf8),
                   let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             else { return }
-            if !self.ready {
-                self.ready = true
+            if self.claimFirstLine() {
+                // The first line acknowledges the subscription — unless it is
+                // a rejection. Treating a rejection as an ack would leave the
+                // bridge believing it has live events for a pane it does not.
+                if let error = object["error"] as? [String: Any] {
+                    let message = error["message"] as? String ?? "subscription rejected"
+                    // Latch first: lines buffered behind the rejection in the
+                    // same packet would otherwise still come out as events on
+                    // a stream that just reported itself closed.
+                    self.stateLock.lock()
+                    self.stopped = true
+                    self.stateLock.unlock()
+                    self.conn.close()
+                    DispatchQueue.main.async { self.onClosed?(HerdrError.api(message)) }
+                    return
+                }
                 DispatchQueue.main.async { self.onReady?() }
                 return
             }
             DispatchQueue.main.async { self.onEvent?(object) }
         }
         conn.onClosed = { [weak self] error in
-            guard let self, !self.stopped else { return }
+            guard let self, !self.isStopped else { return }
             DispatchQueue.main.async { self.onClosed?(error) }
         }
 
@@ -321,8 +356,23 @@ public final class HerdrEventStream {
     }
 
     public func stop() {
+        stateLock.lock()
         stopped = true
+        stateLock.unlock()
         conn.close()
+    }
+
+    private var isStopped: Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return stopped
+    }
+
+    /// True exactly once, for the acknowledgement line.
+    private func claimFirstLine() -> Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        if ready { return false }
+        ready = true
+        return true
     }
 
     deinit { conn.close() }
@@ -336,6 +386,9 @@ public final class HerdrEventStream {
 final class SocketConnection: @unchecked Sendable {
     var onLine: ((String) -> Void)?
     var onClosed: ((Error?) -> Void)?
+
+    /// No Herdr line comes anywhere near this; only a misbehaving peer does.
+    static let maxLineBytes = 1_048_576
 
     private let path: String
     private var fd: Int32 = -1
@@ -351,6 +404,11 @@ final class SocketConnection: @unchecked Sendable {
         guard handle >= 0 else {
             throw HerdrError.cannotConnect(path, String(cString: strerror(errno)))
         }
+        // The protocol is one-request-per-connection, so the peer closes
+        // aggressively — writing into a just-closed socket without this
+        // raises SIGPIPE, whose default disposition kills the process.
+        var noSigpipe: Int32 = 1
+        setsockopt(handle, SOL_SOCKET, SO_NOSIGPIPE, &noSigpipe, socklen_t(MemoryLayout<Int32>.size))
 
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
@@ -386,6 +444,10 @@ final class SocketConnection: @unchecked Sendable {
             var sent = 0
             while sent < raw.count {
                 let n = Darwin.write(fd, raw.baseAddress!.advanced(by: sent), raw.count - sent)
+                if n < 0, errno == EINTR || errno == EAGAIN { continue }
+                // Any other failure: stop writing and let the read loop
+                // notice the dead peer — a truncated request would otherwise
+                // just look like a server that never answers.
                 if n <= 0 { break }
                 sent += n
             }
@@ -408,17 +470,21 @@ final class SocketConnection: @unchecked Sendable {
             guard handle >= 0 else { break }
 
             let n = Darwin.read(handle, &chunk, chunk.count)
+            if n < 0, errno == EINTR { continue }
             if n <= 0 { break }
             buffer.append(contentsOf: chunk[0..<n])
 
             while let index = buffer.firstIndex(of: UInt8(ascii: "\n")) {
                 let lineData = buffer.prefix(upTo: index)
-                buffer = buffer.suffix(from: buffer.index(after: index))
+                buffer.removeSubrange(...index)
                 if let line = String(data: lineData, encoding: .utf8)?
                     .trimmingCharacters(in: .whitespacesAndNewlines), !line.isEmpty {
                     onLine?(line)
                 }
             }
+            // A line that never ends is not Herdr — drop the connection
+            // rather than hold an unbounded buffer for it.
+            if buffer.count > SocketConnection.maxLineBytes { break }
         }
         lock.lock(); let wasClosed = closed; lock.unlock()
         if !wasClosed { onClosed?(nil) }

@@ -93,6 +93,10 @@ final class FloatingPanel: NSObject {
         )
         panel.titlebarAppearsTransparent = true
         panel.titleVisibility = .hidden
+        // This controller keeps a strong reference and only ever orderOuts,
+        // but the AppKit default releases a closed window under ARC — any
+        // future path through close()/performClose: would over-release.
+        panel.isReleasedWhenClosed = false
         for button: NSWindow.ButtonType in [.closeButton, .miniaturizeButton, .zoomButton] {
             panel.standardWindowButton(button)?.isHidden = true
         }

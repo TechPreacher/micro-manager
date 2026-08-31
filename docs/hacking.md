@@ -357,7 +357,15 @@ whether or not it took.
 
 ```js
 // Bind key 3 (row 1, column 1) so it can be lit.
-const layer = config.profiles[config.activeProfileId ?? 0].layers[0];
+// `activeProfileId` names a profile: match it against each profile's own
+// `id` first, and only fall back to reading it as an index. On a stock pad
+// (one profile, id 0) every interpretation agrees, but a pad with deleted
+// or reordered profiles is exactly where a wrong pick verifies as success
+// and lights nothing.
+const active = config.activeProfileId ?? 0;
+const profile = config.profiles.find((p) => p.id === active)
+  ?? config.profiles[active] ?? config.profiles[0];
+const layer = profile.layers[0];
 layer.layout.keymap[1][1] = "KV_OAI_AG03";
 
 await dev.call("fs.write", { file: "keymap.json", data: JSON.stringify(config) });

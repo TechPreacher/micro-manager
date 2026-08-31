@@ -210,17 +210,23 @@ struct EmulatorView: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     VStack(alignment: .leading, spacing: 1) {
+                        // Identity is the line's lifetime number, which stays
+                        // stable as the ring buffer drops old lines — an
+                        // array offset shifts under every removeFirst.
+                        let base = emulator.trafficTotal - emulator.traffic.count
                         ForEach(Array(emulator.traffic.enumerated()), id: \.offset) { index, line in
                             Text(line)
                                 .font(.system(size: 10, design: .monospaced))
                                 .foregroundStyle(.secondary)
                                 .frame(maxWidth: .infinity, alignment: .leading)
-                                .id(index)
+                                .id(base + index)
                         }
                     }
                 }
-                .onChange(of: emulator.traffic.count) { count in
-                    proxy.scrollTo(count - 1, anchor: .bottom)
+                // `traffic.count` pins at the buffer cap; the total keeps
+                // counting, so the follow-scroll survives saturation.
+                .onChange(of: emulator.trafficTotal) { total in
+                    proxy.scrollTo(total - 1, anchor: .bottom)
                 }
             }
             .frame(minHeight: 90)

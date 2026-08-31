@@ -10,8 +10,15 @@ final class LiveHerdrTests: XCTestCase {
     }
 
     func testSocketPathResolves() {
-        let path = HerdrClient.socketPath()
-        XCTAssertTrue(path.hasSuffix("herdr/herdr.sock") || !path.isEmpty)
+        let saved = ProcessInfo.processInfo.environment["HERDR_SOCKET_PATH"]
+        defer { if let saved { setenv("HERDR_SOCKET_PATH", saved, 1) } else { unsetenv("HERDR_SOCKET_PATH") } }
+
+        setenv("HERDR_SOCKET_PATH", "/custom/herdr.sock", 1)
+        XCTAssertEqual(HerdrClient.socketPath(), "/custom/herdr.sock")
+
+        // Empty means unset, falling back to the config-directory default.
+        setenv("HERDR_SOCKET_PATH", "", 1)
+        XCTAssertTrue(HerdrClient.socketPath().hasSuffix("herdr/herdr.sock"))
     }
 
     func testListAgentsRoundTrip() async throws {

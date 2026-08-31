@@ -40,9 +40,11 @@ final class AnsiHTMLTests: XCTestCase {
     }
 
     func testTruecolourAndIndexedColour() {
+        // Both through `render`, so the parsing branch is exercised, not just
+        // the palette table.
         XCTAssertTrue(AnsiHTML.render("\u{1B}[38;2;18;52;86mx").contains("#123456"))
+        XCTAssertTrue(AnsiHTML.render("\u{1B}[38;5;196mx").contains("#FF0000"))
         XCTAssertEqual(AnsiHTML.xterm256(232), "#080808")
-        XCTAssertEqual(AnsiHTML.xterm256(196), "#FF0000")
     }
 
     /// A cursor-hide left in the output must not appear as literal text.

@@ -42,9 +42,18 @@ final class VoiceController {
         }
     }
 
+    /// Whether the system dialog has been raised already: once per launch is
+    /// plenty. Raising it on every press steals focus from the terminal the
+    /// user is mid-thought in — the exact thing this key exists to protect.
+    private var promptedForAccessibility = false
+
     private func tapTriggerKey() throws {
-        let prompt = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
-        guard AXIsProcessTrustedWithOptions([prompt: true] as CFDictionary) else {
+        guard AXIsProcessTrusted() else {
+            if !promptedForAccessibility {
+                promptedForAccessibility = true
+                let prompt = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+                _ = AXIsProcessTrustedWithOptions([prompt: true] as CFDictionary)
+            }
             throw VoiceFailure.accessibilityDenied
         }
 

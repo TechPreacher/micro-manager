@@ -192,9 +192,14 @@ final class LandPanelController {
             do {
                 plan = try await GitButler.landPlan(in: directory)
             } catch {
+                guard self.generation == generation else { return }
                 panel.append(PanelHTML.note(error.localizedDescription))
                 break
             }
+            // Checked after every await, not just at the end: each land can
+            // take two minutes, and a panel closed meanwhile may already be
+            // showing a different repo when this run resumes.
+            guard self.generation == generation else { return }
             guard let branch = plan.first else { break }
             guard !landed.contains(branch) else {
                 panel.append(PanelHTML.note(
@@ -207,9 +212,11 @@ final class LandPanelController {
             panel.append(PanelHTML.command("but land --yes \(branch)"))
             do {
                 let output = try await GitButler.land(branch, in: directory)
+                guard self.generation == generation else { return }
                 panel.append(PanelHTML.output(output))
                 if !output.succeeded { break }
             } catch {
+                guard self.generation == generation else { return }
                 panel.append(PanelHTML.note(error.localizedDescription))
                 break
             }
@@ -218,8 +225,10 @@ final class LandPanelController {
         panel.append(PanelHTML.command("but status"))
         do {
             let status = try await GitButler.status(in: directory)
+            guard self.generation == generation else { return }
             panel.append(PanelHTML.output(status))
         } catch {
+            guard self.generation == generation else { return }
             panel.append(PanelHTML.note(error.localizedDescription))
         }
 

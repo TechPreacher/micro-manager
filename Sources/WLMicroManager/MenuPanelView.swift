@@ -112,19 +112,11 @@ struct MenuPanelView: View {
         let agent = slot.flatMap { $0 < bridge.agents.count ? bridge.agents[$0] : nil }
 
         return Button {
-            if isStackKey {
-                StackPanelController.shared.toggle()
-            } else if isTabCycleKey {
-                Task { await bridge.cycleTabs() }
-            } else if isLandKey {
-                LandPanelController.shared.handleLandKey()
-            } else if let macroText {
-                Task { await bridge.injectPrompt(macroText) }
-            } else if isVoiceKey {
-                VoiceController.shared.handleVoiceKey()
-            } else if let slot, agent != nil {
-                Task { await bridge.focusSlot(slot) }
-            }
+            // The one dispatch switch lives in the bridge; a second copy here
+            // drifted (it skipped `onKeyIntercept`, so clicking a key in the
+            // menu during a land confirmation focused an agent instead of
+            // cancelling). Only presentation stays in the view.
+            bridge.handleKeyPress(index)
         } label: {
             RoundedRectangle(cornerRadius: 5)
                 .fill(color ?? Color.secondary.opacity(isBound ? 0.16 : 0.07))

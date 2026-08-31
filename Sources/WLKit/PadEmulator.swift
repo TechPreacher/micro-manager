@@ -42,9 +42,19 @@ public final class PadEmulator: ObservableObject {
     @Published public private(set) var ambientZone = OAI.Zone.dark
     /// A short tail of RPC traffic, so the window can show what it was told.
     @Published public private(set) var traffic: [String] = []
+    /// Lines noted over this emulator's lifetime — monotonic, unlike
+    /// `traffic.count`, which pins at the ring-buffer cap. Views keying their
+    /// auto-scroll off a count need this one, or the scroll silently dies the
+    /// moment the buffer saturates.
+    @Published public private(set) var trafficTotal = 0
 
     /// Set by `WLDevice` to deliver device-pushed notifications.
     var onNotify: ((String, Any?) -> Void)?
+
+    /// When set, `fs.write` answers `{"ok":1}` but keeps the old keymap — the
+    /// firmware-that-lies scenario `KeymapManager.apply`'s read-back check
+    /// exists to catch.
+    public var ignoreWrites = false
 
     private var keymap: [String: Any] = PadEmulator.stockKeymap()
 
@@ -88,6 +98,10 @@ public final class PadEmulator: ObservableObject {
                   let object = try? JSONSerialization.jsonObject(with: Data(text.utf8)),
                   let config = object as? [String: Any]
             else { return (nil, "bad payload") }
+            guard !ignoreWrites else {
+                note("fs.write keymap.json — accepted and ignored")
+                return (["ok": 1], nil)
+            }
             keymap = config
             refreshBinding()
             note("fs.write keymap.json — \(bound.count) keys now bound")
@@ -203,9 +217,12 @@ public final class PadEmulator: ObservableObject {
                 dict.values.forEach(scan)
             }
         }
-        let index = keymap["activeProfileId"] as? Int ?? 0
+        // `activeProfileId` resolved the way KeymapManager does: by id first,
+        // positionally as the fallback.
+        let active = keymap["activeProfileId"] as? Int ?? 0
         if let profiles = keymap["profiles"] as? [[String: Any]] {
-            let profile = index < profiles.count ? profiles[index] : profiles.first
+            let profile = profiles.first { ($0["id"] as? Int) == active }
+                ?? (profiles.indices.contains(active) ? profiles[active] : profiles.first)
             if let layers = profile?["layers"] as? [[String: Any]], let layer = layers.first {
                 scan(layer)
             }
@@ -215,6 +232,7 @@ public final class PadEmulator: ObservableObject {
 
     private func note(_ line: String) {
         traffic.append(line)
+        trafficTotal += 1
         if traffic.count > 80 { traffic.removeFirst(traffic.count - 80) }
     }
 

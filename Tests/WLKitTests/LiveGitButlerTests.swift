@@ -15,12 +15,29 @@ final class LiveGitButlerTests: XCTestCase {
         return path
     }
 
-    func testFindsTheBinaryOutsideTheLaunchdPath() throws {
-        // The interesting case is a GUI app's minimal PATH, so check the
-        // search list finds it rather than trusting the test's inherited one.
-        let path = try binary()
-        print("but: \(path)")
-        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: path))
+    /// Not live — the override behaviour is deterministic. An executable
+    /// `WL_BUT_PATH` wins the search outright; a bogus one must be ignored
+    /// rather than trusted.
+    func testExplicitOverrideWinsTheSearch() throws {
+        let saved = ProcessInfo.processInfo.environment["WL_BUT_PATH"]
+        defer { if let saved { setenv("WL_BUT_PATH", saved, 1) } else { unsetenv("WL_BUT_PATH") } }
+
+        let dir = NSTemporaryDirectory() + "wl-but-\(UUID().uuidString)"
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        let fake = dir + "/but"
+        FileManager.default.createFile(
+            atPath: fake,
+            contents: Data("#!/bin/sh\n".utf8),
+            attributes: [.posixPermissions: 0o755]
+        )
+
+        setenv("WL_BUT_PATH", fake, 1)
+        XCTAssertEqual(GitButler.searchForBinary(), fake)
+
+        // Non-executable: the override is ignored and the search moves on.
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: fake)
+        XCTAssertNotEqual(GitButler.searchForBinary(), fake)
     }
 
     func testStatusOfThisRepoRendersToHTML() async throws {
